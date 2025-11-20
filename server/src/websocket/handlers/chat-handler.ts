@@ -4,6 +4,8 @@ import { Room } from '../../database/models/Room'
 import { chatMessageSchema, joinRoomSchema } from '@realtime-apps/shared'
 import { logger } from '../../utils/logger'
 import { globalRateLimiter } from '../../middleware/rate-limit'
+import { isValidEmoji } from '../../security/emoji-validator'
+import { InputValidator } from '../../security/input-validator'
 import sanitizeHtml from 'sanitize-html'
 import { v4 as uuidv4 } from 'uuid'
 
@@ -17,6 +19,13 @@ export class ChatHandler {
     // Join room
     socket.on('room:join', async (data: unknown) => {
       try {
+        // Rate limit check
+        if (!globalRateLimiter.check(userId, 'room:join')) {
+          socket.emit('error', { message: 'Rate limit exceeded. Too many room join attempts.' })
+          logger.warn(`Rate limit exceeded for room:join by user ${userId}`)
+          return
+        }
+
         const result = joinRoomSchema.safeParse(data)
         if (!result.success) {
           socket.emit('error', { message: 'Invalid room data' })
@@ -24,6 +33,13 @@ export class ChatHandler {
         }
 
         const { roomId } = result.data
+
+        // Validate room ID format
+        const roomIdValidation = InputValidator.validateRoomId(roomId)
+        if (!roomIdValidation.isValid) {
+          socket.emit('error', { message: roomIdValidation.error })
+          return
+        }
 
         // Check if room exists and user has access
         const room = await Room.findOne({ id: roomId })
@@ -292,11 +308,31 @@ export class ChatHandler {
     // Message reactions
     socket.on('message:react', async (data: { messageId: string; roomId: string; reaction: string }) => {
       try {
+        // Rate limit check
+        if (!globalRateLimiter.check(userId, 'message:react')) {
+          socket.emit('error', { message: 'Rate limit exceeded' })
+          return
+        }
+
         const { messageId, roomId, reaction } = data
+
+        // Validate emoji
+        if (!isValidEmoji(reaction)) {
+          socket.emit('error', { message: 'Invalid reaction. Only valid emojis are allowed.' })
+          logger.warn(`Invalid emoji reaction attempted by user ${userId}: ${reaction}`)
+          return
+        }
 
         const message = await Message.findOne({ id: messageId })
         if (!message) {
           socket.emit('error', { message: 'Message not found' })
+          return
+        }
+
+        // Verify user has access to room
+        const room = await Room.findOne({ id: roomId })
+        if (!room || !room.participants.includes(userId)) {
+          socket.emit('error', { message: 'Access denied' })
           return
         }
 
